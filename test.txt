@@ -1,224 +1,84 @@
-1) Wczytaj 1 PDF i odpal ai_parse_*
+1) Parse 1 PDF i wyciągnij elementy typu table z bbox
 from pyspark.sql import functions as F
 
 pdf_path = "dbfs:/FileStore/pdfs/moj.pdf"
-# pdf_path = "/Volumes/<catalog>/<schema>/<volume>/docs/moj.pdf"
 
-df = (spark.read.format("binaryFile")
-      .load(pdf_path)
-      .select(F.col("path"), F.col("content").alias("pdf_bytes")))
+pdf_df = (spark.read.format("binaryFile")
+          .load(pdf_path)
+          .select(F.col("path"), F.col("content").alias("pdf_bytes")))
 
-# ai_parse_documents vs ai_parse_document (fallback)
-try:
-    parsed = df.select("path", F.expr("ai_parse_documents(pdf_bytes)").alias("parsed"))
-except Exception:
-    parsed = df.select("path", F.expr("ai_parse_document(pdf_bytes)").alias("parsed"))
+# WYMUSZ v2.0 (ważne)
+parsed_df = pdf_df.select(
+    "path",
+    F.expr("ai_parse_document(pdf_bytes, map('version','2.0'))").alias("parsed")
+)
 
-# Ujednolicenie do JSON string (łatwiej obrabiać)
-parsed_json_df = parsed.select("path", F.to_json("parsed").alias("parsed_json"))
-display(parsed_json_df)
-2) Szybka inspekcja: jakie pola masz w wyniku
-import json
+# Rozbij na elements[]
+elements_df = parsed_df.select(
+    "path",
+    F.explode(F.col("parsed.document.elements")).alias("el")
+)
 
-row = parsed_json_df.select("parsed_json").first()
-doc = json.loads(row["parsed_json"])
+tables_df = elements_df.where(F.col("el.type") == F.lit("table")).select(
+    "path",
+    F.col("el.id").alias("element_id"),
+    F.col("el.content").alias("table_html"),
+    F.col("el.bbox").alias("bbox")  # array: [{coord:[...], page_id:int}]
+)
 
-# pokaż top-level klucze
-print("Top keys:", list(doc.keys())[:50])
+display(tables_df)
 
-# często spotykane ścieżki: doc["pages"], doc["tables"], doc["paragraphs"], doc["blocks"], doc["text"]
-if "pages" in doc:
-    print("pages:", len(doc["pages"]))
-    print("page[0] keys:", list(doc["pages"][0].keys()))
+bbox w tym schemacie to tablica, gdzie każdy wpis ma coord (pikselowe współrzędne) i page_id (0-based).
 
-To pozwala Ci od razu zobaczyć, czy masz np. pages[].lines[], pages[].blocks[], tables[], tables[].cells[] i gdzie siedzą bboxy.
+2) Chunkowanie tabeli (HTML) po N wierszy + przypięcie bbox/page_id
 
-3) Ujednolicenie bboxów (koordynatów) do jednego formatu
+To daje “chunki” tabeli (np. do RAG / dalszego parsowania), a do podświetlania używasz bbox całej tabeli (albo wielu bboxów, jeśli tabela jest pocięta na kilka elementów/stron).
 
-Najczęściej bbox występuje jako:
-
-bbox: {x, y, width, height} albo
-
-boundingBox: {left, top, right, bottom} albo
-
-polygon: [{x,y}...]
-
-Poniżej helpery w Pythonie do normalizacji (działają na obiekcie doc już z json.loads):
-
-import re
-from typing import Dict, Any, Optional, List, Tuple
-
-def norm_bbox(obj: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    """
-    Zwraca bbox jako {x0,y0,x1,y1} w tym samym układzie, w którym daje parser.
-    (czy to jest 0..1 czy punkty/piksele – zależy od parsera; zachowujemy to 1:1)
-    """
-    if obj is None:
-        return None
-
-    # wariant: left/top/right/bottom
-    bb = obj.get("boundingBox") or obj.get("bbox")
-    if isinstance(bb, dict):
-        if all(k in bb for k in ("left","top","right","bottom")):
-            return {"x0": float(bb["left"]), "y0": float(bb["top"]), "x1": float(bb["right"]), "y1": float(bb["bottom"])}
-        if all(k in bb for k in ("x","y","width","height")):
-            x0, y0 = float(bb["x"]), float(bb["y"])
-            return {"x0": x0, "y0": y0, "x1": x0 + float(bb["width"]), "y1": y0 + float(bb["height"])}
-
-    # wariant: polygon (lista punktów)
-    poly = obj.get("polygon") or obj.get("vertices")
-    if isinstance(poly, list) and poly:
-        xs = [p.get("x") for p in poly if "x" in p]
-        ys = [p.get("y") for p in poly if "y" in p]
-        if xs and ys:
-            return {"x0": float(min(xs)), "y0": float(min(ys)), "x1": float(max(xs)), "y1": float(max(ys))}
-
-    return None
-4) Spis treści (TOC) + koordynaty
-4.1 Skąd wziąć “linie” do TOC
-
-Jeśli masz pages[].lines[] albo pages[].blocks[] z tekstem, bierzemy elementy tekstowe z bboxami i filtrujemy regexem “coś …… numer strony”.
-
-Poniższy kod próbuje znaleźć listę elementów tekstowych na stronach (obsługuje kilka popularnych nazw pól):
-
-def iter_text_items(doc: Dict[str, Any]):
-    pages = doc.get("pages") or []
-    for pi, page in enumerate(pages, start=1):
-        # możliwe pola z liniami/blokami:
-        candidates = []
-        for k in ("lines", "blocks", "paragraphs", "spans"):
-            v = page.get(k)
-            if isinstance(v, list):
-                candidates.extend(v)
-
-        for it in candidates:
-            text = it.get("text") or it.get("content") or it.get("value")
-            if not text or not isinstance(text, str):
-                continue
-            bb = norm_bbox(it)
-            yield {
-                "page": pi,
-                "text": text.strip(),
-                "bbox": bb,
-                "raw": it
-            }
-
-toc_line_re = re.compile(r"""
-^
-(?P<title>.*?)
-(?:\.{2,}|\s{2,}|\t+)      # kropki lub większy odstęp
-(?P<pageno>\d{1,4})
-\s*$
-""", re.VERBOSE)
-
-# Heurystyka: często TOC jest na początku; tu możesz ograniczyć np. do pierwszych N stron
-MAX_TOC_PAGES = 5
-
-items = [x for x in iter_text_items(doc) if x["page"] <= MAX_TOC_PAGES]
-
-toc = []
-for x in items:
-    m = toc_line_re.match(x["text"])
-    if not m:
-        continue
-    title = m.group("title").strip(" .\t")
-    pageno = int(m.group("pageno"))
-    if len(title) < 3:
-        continue
-    toc.append({
-        "toc_page": x["page"],            # strona, na której jest spis treści
-        "entry_title": title,
-        "target_page": pageno,            # strona docelowa z TOC
-        "bbox": x["bbox"],                # bbox linii w TOC (podświetlenie w TOC)
-        "text": x["text"]
-    })
-
-toc[:10], len(toc)
-
-Wynik toc to lista wpisów z koordynatami linii w spisie treści.
-
-Jeśli chcesz też koordynaty nagłówków na stronach docelowych, wtedy robisz drugi krok: szukasz na target_page linii/elementów pasujących do entry_title (np. fuzzy match) i bierzesz bbox.
-
-
-5) Tabele + koordynaty komórek
-
-Jeżeli parser zwraca tables[] lub pages[].tables[], zwykle znajdziesz:
-
-bbox tabeli,
-
-komórki (cells[]) z tekstem, wiersz/kolumna oraz bbox.
-
-Kod poniżej:
-
-zbiera tabele z dokumentu (kilka możliwych ścieżek),
-
-zwraca listę komórek z (page, table_index, row, col, text, bbox).
-
-def iter_tables(doc: Dict[str, Any]):
-    # wariant A: top-level tables
-    if isinstance(doc.get("tables"), list):
-        for ti, t in enumerate(doc["tables"], start=1):
-            yield (None, ti, t)
-
-    # wariant B: tables per page
-    pages = doc.get("pages") or []
-    for pi, page in enumerate(pages, start=1):
-        if isinstance(page.get("tables"), list):
-            for ti, t in enumerate(page["tables"], start=1):
-                yield (pi, ti, t)
-
-tables_cells = []
-for page_no, table_no, t in iter_tables(doc):
-    t_bbox = norm_bbox(t)
-    cells = t.get("cells") or t.get("tableCells") or []
-    for c in cells:
-        text = (c.get("text") or c.get("content") or "").strip()
-        row = c.get("rowIndex") if c.get("rowIndex") is not None else c.get("row")
-        col = c.get("columnIndex") if c.get("columnIndex") is not None else c.get("col")
-        c_bbox = norm_bbox(c)
-        # Jeśli komórka nie ma bbox, czasem jest w polu "layout"/"span"
-        if c_bbox is None and isinstance(c.get("layout"), dict):
-            c_bbox = norm_bbox(c["layout"])
-
-        tables_cells.append({
-            "page": page_no or t.get("pageNumber") or None,
-            "table_index": table_no,
-            "table_bbox": t_bbox,
-            "row": int(row) if row is not None else None,
-            "col": int(col) if col is not None else None,
-            "cell_text": text,
-            "cell_bbox": c_bbox,
-        })
-
-tables_cells[:10], len(tables_cells)
-
-Jeśli len(tables_cells) == 0, to znaczy że Twoja wersja ai_parse_* nie materializuje tabel jako struktury. Wtedy opcja “co lepiej radzi sobie z tabelką” zwykle polega na:
-
-wzięciu elementów tekstowych + bboxów
-
-wykryciu “siatki” po pozycjach X/Y (klastrowanie po kolumnach/wierszach)
-
-i zbudowaniu tabeli z layoutu (to da się zrobić deterministycznie, bez LLM).
-
-Jeżeli chcesz, mogę dać gotowy algorytm klastrowania kolumn/wierszy po bboxach (działa dobrze na tabelach z wyraźnymi kolumnami).
-
-6) Mapowanie koordynatów na podświetlenie w PDF
-
-Musisz wiedzieć w jakiej przestrzeni są koordynaty:
-
-jeśli 0..1 (znormalizowane), to:
-
-x_px = x_norm * page_width_px, y_px = y_norm * page_height_px
-
-jeśli to punkty (PDF points), to często już jest w “PDF units”.
-
-Wiele parserów podaje też page.width i page.height. Sprawdź w doc["pages"][0] czy masz takie pola.
-
-7) Minimalny “output” do testu (TOC + komórki tabel) jako DataFrame
 import pandas as pd
+from bs4 import BeautifulSoup
 
-toc_df = pd.DataFrame(toc)
-cells_df = pd.DataFrame(tables_cells)
+ROWS_PER_CHUNK = 20
 
-display(spark.createDataFrame(toc_df))    # spis treści z bboxami
-display(spark.createDataFrame(cells_df))  # komórki tabel z bboxami
+def chunk_table_html(html: str, rows_per_chunk: int = 20):
+    soup = BeautifulSoup(html or "", "html.parser")
+    rows = soup.select("tr")
+    chunks = []
+    for i in range(0, len(rows), rows_per_chunk):
+        chunk_rows = rows[i:i+rows_per_chunk]
+        # zbuduj minimalny HTML dla chunka
+        chunk_html = "<table>" + "".join(str(r) for r in chunk_rows) + "</table>"
+        chunks.append({
+            "row_start": i,
+            "row_end": min(i + rows_per_chunk - 1, len(rows) - 1),
+            "chunk_html": chunk_html
+        })
+    return chunks
+
+# Zbierz do drivera tylko do testu na 1 PDF (dla wielu pdfów rób to w pandas_udf)
+rows = tables_df.collect()
+
+out = []
+for r in rows:
+    bbox = r["bbox"]  # lista dictów: {coord: [...], page_id: ...}
+    for b in (bbox or []):
+        page_id = b.get("page_id")
+        coord = b.get("coord")  # zwykle [x0,y0,x1,y1] albo podobny format w px
+        for ch in chunk_table_html(r["table_html"], ROWS_PER_CHUNK):
+            out.append({
+                "path": r["path"],
+                "element_id": r["element_id"],
+                "page_id": page_id,
+                "coord": coord,
+                "row_start": ch["row_start"],
+                "row_end": ch["row_end"],
+                "chunk_html": ch["chunk_html"]
+            })
+
+chunks_df = spark.createDataFrame(pd.DataFrame(out))
+display(chunks_df)
+3) Jeśli dalej masz “pusto”: sprawdź error_status
+
+ai_parse_document zwraca też error_status per strona. To powie wprost, czemu nic nie wyszło.
+
+errors_df = parsed_df.select("path", F.col("parsed.error_status").alias("error_status"))
+display(errors_df)
