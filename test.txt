@@ -1,84 +1,198 @@
-1) Parse 1 PDF i wyciągnij elementy typu table z bbox
+0️⃣ Konfiguracja
 from pyspark.sql import functions as F
+from pyspark.sql.types import *
+import json
 
-pdf_path = "dbfs:/FileStore/pdfs/moj.pdf"
-
-pdf_df = (spark.read.format("binaryFile")
-          .load(pdf_path)
-          .select(F.col("path"), F.col("content").alias("pdf_bytes")))
-
-# WYMUSZ v2.0 (ważne)
-parsed_df = pdf_df.select(
-    "path",
-    F.expr("ai_parse_document(pdf_bytes, map('version','2.0'))").alias("parsed")
+pdf_path = "dbfs:/FileStore/sample.pdf"
+1️⃣ Załaduj i sparsuj PDF (pełny layout)
+raw_df = spark.range(1).select(
+    F.expr(f"""
+        ai_parse_document(
+            file => '{pdf_path}',
+            options => map(
+                'include_layout', 'true',
+                'include_tables', 'true',
+                'include_images', 'true',
+                'include_coordinates', 'true',
+                'output_format', 'json'
+            )
+        )
+    """).alias("raw_json")
 )
 
-# Rozbij na elements[]
-elements_df = parsed_df.select(
-    "path",
-    F.explode(F.col("parsed.document.elements")).alias("el")
-)
+raw_json = raw_df.select("raw_json").first()["raw_json"]
 
-tables_df = elements_df.where(F.col("el.type") == F.lit("table")).select(
-    "path",
-    F.col("el.id").alias("element_id"),
-    F.col("el.content").alias("table_html"),
-    F.col("el.bbox").alias("bbox")  # array: [{coord:[...], page_id:int}]
-)
+if not raw_json:
+    raise ValueError("Document parsing failed or returned empty result")
 
-display(tables_df)
+doc = json.loads(raw_json)
+2️⃣ Strona 1 – nagłówek i inne elementy
+pages = doc.get("pages", [])
 
-bbox w tym schemacie to tablica, gdzie każdy wpis ma coord (pikselowe współrzędne) i page_id (0-based).
+page1 = next((p for p in pages if p.get("page_number") == 1), None)
 
-2) Chunkowanie tabeli (HTML) po N wierszy + przypięcie bbox/page_id
+if page1:
+    elements = page1.get("elements", [])
+    
+    headers = [e for e in elements if e.get("type") in ["title", "header"]]
+    other_content = [e for e in elements if e.get("type") not in ["title", "header"]]
 
-To daje “chunki” tabeli (np. do RAG / dalszego parsowania), a do podświetlania używasz bbox całej tabeli (albo wielu bboxów, jeśli tabela jest pocięta na kilka elementów/stron).
+    print("HEADERS:")
+    for h in headers:
+        print(h.get("content"), h.get("bbox"))
 
-import pandas as pd
-from bs4 import BeautifulSoup
+    print("\nOTHER ELEMENTS:")
+    for o in other_content:
+        print(o.get("type"), o.get("content"))
+3️⃣ Spis treści
 
-ROWS_PER_CHUNK = 20
+Często TOC jest:
 
-def chunk_table_html(html: str, rows_per_chunk: int = 20):
-    soup = BeautifulSoup(html or "", "html.parser")
-    rows = soup.select("tr")
-    chunks = []
-    for i in range(0, len(rows), rows_per_chunk):
-        chunk_rows = rows[i:i+rows_per_chunk]
-        # zbuduj minimalny HTML dla chunka
-        chunk_html = "<table>" + "".join(str(r) for r in chunk_rows) + "</table>"
-        chunks.append({
-            "row_start": i,
-            "row_end": min(i + rows_per_chunk - 1, len(rows) - 1),
-            "chunk_html": chunk_html
-        })
-    return chunks
+type == "list"
 
-# Zbierz do drivera tylko do testu na 1 PDF (dla wielu pdfów rób to w pandas_udf)
-rows = tables_df.collect()
+albo tekst zawierający wiele kropek + numer strony
 
-out = []
-for r in rows:
-    bbox = r["bbox"]  # lista dictów: {coord: [...], page_id: ...}
-    for b in (bbox or []):
-        page_id = b.get("page_id")
-        coord = b.get("coord")  # zwykle [x0,y0,x1,y1] albo podobny format w px
-        for ch in chunk_table_html(r["table_html"], ROWS_PER_CHUNK):
-            out.append({
-                "path": r["path"],
-                "element_id": r["element_id"],
-                "page_id": page_id,
-                "coord": coord,
-                "row_start": ch["row_start"],
-                "row_end": ch["row_end"],
-                "chunk_html": ch["chunk_html"]
+toc_candidates = []
+
+for p in pages:
+    for e in p.get("elements", []):
+        content = (e.get("content") or "").lower()
+        if e.get("type") == "list" or ("...." in content):
+            toc_candidates.append({
+                "page": p.get("page_number"),
+                "content": e.get("content"),
+                "bbox": e.get("bbox")
             })
 
-chunks_df = spark.createDataFrame(pd.DataFrame(out))
-display(chunks_df)
-3) Jeśli dalej masz “pusto”: sprawdź error_status
+print("TABLE OF CONTENTS CANDIDATES:")
+for t in toc_candidates:
+    print(t)
+4️⃣ Tabela z 4 strony (prosta)
+tables = doc.get("tables", [])
 
-ai_parse_document zwraca też error_status per strona. To powie wprost, czemu nic nie wyszło.
+tables_page4 = [t for t in tables if t.get("page_number") == 4]
 
-errors_df = parsed_df.select("path", F.col("parsed.error_status").alias("error_status"))
-display(errors_df)
+def extract_table_long(table):
+    rows = []
+    for cell in table.get("cells", []):
+        rows.append({
+            "row": cell.get("row_index"),
+            "col": cell.get("column_index"),
+            "text": cell.get("text"),
+            "bbox": cell.get("bbox")
+        })
+    return rows
+
+if tables_page4:
+    table4_data = extract_table_long(tables_page4[0])
+    print("PAGE 4 TABLE (LONG FORMAT):")
+    for r in table4_data:
+        print(r)
+5️⃣ Tabela z 5 strony (skomplikowana)
+
+Różne formaty → nie pivotujemy automatycznie
+Zostawiamy jako long + naprawiamy scalenia.
+
+tables_page5 = [t for t in tables if t.get("page_number") == 5]
+
+def normalize_cells(table):
+    normalized = []
+    for cell in table.get("cells", []):
+        text = (cell.get("text") or "").strip()
+        
+        # heurystyka na scalone komórki
+        if "\n" in text:
+            parts = [p.strip() for p in text.split("\n") if p.strip()]
+        else:
+            parts = [text]
+        
+        for part in parts:
+            normalized.append({
+                "row": cell.get("row_index"),
+                "col": cell.get("column_index"),
+                "text": part,
+                "bbox": cell.get("bbox")
+            })
+    return normalized
+
+if tables_page5:
+    table5_data = normalize_cells(tables_page5[0])
+    print("PAGE 5 COMPLEX TABLE (NORMALIZED):")
+    for r in table5_data:
+        print(r)
+
+To:
+
+nie wywali się przy brakujących wartościach
+
+rozbije scalone komórki z newline
+
+zachowa bbox
+
+6️⃣ Wyciągnij cały tekst z PDF
+full_text = []
+
+for p in pages:
+    for e in p.get("elements", []):
+        if e.get("type") == "text":
+            full_text.append(e.get("content"))
+
+full_text_combined = "\n".join(full_text)
+
+print(full_text_combined[:1000])
+7️⃣ Tekst pod zdjęciem
+
+Zasada:
+
+znajdź element image
+
+sprawdź najbliższy tekst poniżej (po bbox y)
+
+image_captions = []
+
+for p in pages:
+    elements = p.get("elements", [])
+    images = [e for e in elements if e.get("type") == "image"]
+    texts = [e for e in elements if e.get("type") == "text"]
+
+    for img in images:
+        img_bbox = img.get("bbox", [])
+        if not img_bbox:
+            continue
+        
+        img_bottom = img_bbox[1]
+
+        possible_captions = [
+            t for t in texts
+            if t.get("bbox") and t.get("bbox")[3] < img_bottom
+        ]
+
+        if possible_captions:
+            closest = sorted(
+                possible_captions,
+                key=lambda x: abs(x.get("bbox")[3] - img_bottom)
+            )[0]
+
+            image_captions.append({
+                "page": p.get("page_number"),
+                "caption": closest.get("content")
+            })
+
+print("IMAGE CAPTIONS:")
+print(image_captions)
+8️⃣ Informacje typu numer strony
+page_info = []
+
+for p in pages:
+    page_info.append({
+        "page_number": p.get("page_number"),
+        "width": p.get("width"),
+        "height": p.get("height"),
+        "num_elements": len(p.get("elements", []))
+    })
+
+print(page_info)
+🔒 Dlaczego to jest „bulletproof”
+
+
+buduj specyficzny parser
